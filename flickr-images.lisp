@@ -1,5 +1,5 @@
 (ql:quickload '(:sdl2 :sdl2-image :sdl2-ttf :dexador :quri :cl-json) 
-	      :silent t)
+              :silent t)
 
 (defpackage :flickr-images
   (:use :cl)
@@ -12,17 +12,20 @@
 (defparameter *max-size* 800)
 (defparameter *num-rows* 2)
 (defparameter *num-cols* 3)
-;;(defparameter *font-file* "/usr/share/fonts/gnu-free/FreeSans.ttf")
+(defparameter *cell-size* 350)
+(defparameter *cell-pad* 40)
+(defparameter *idle-delay* 500)         ; pause in ms
+
 (defparameter *font-file*
   "/usr/share/fonts/urw-base35/NimbusSansNarrow-Regular.otf")
 (defparameter *font-size* 18)
+
 ;;(defparameter *keyword* "tiger")
 ;;(defparameter *keyword* "cat")
 (defparameter *keyword* "kitty")
 (defparameter *image-size* "m")   ; t = 100, m = 240, q = 150 sq, b = 1024
-(defparameter *cell-size* 350)
-(defparameter *cell-pad* 40)
-(defparameter *idle-delay* 500)		; pause in ms
+
+(defparameter *debug* nil)
 
 
 ;;; ── Flickr API ─────────────────────────────────────────────────────────
@@ -78,24 +81,25 @@
 ;; Use like this:
 ;; (get-random-url (flickr-get-interesting 6) "t")
 
-(defun flickr-get-interesting (&optional (num-urls 10))
+(defun flickr-get-interesting (&optional (num-urls 10) (page 1))
   "Return a random photo URL from Flickr interestingness."
   (let* ((result (flickr-call "flickr.interestingness.getList"
-                              "per_page" (write-to-string num-urls)))
+                              "per_page" (write-to-string num-urls)
+                              "page"     (write-to-string page)))
          (photos (cdr (assoc :photo
-			     (cdr (assoc :photos result))))))
+                             (cdr (assoc :photos result))))))
     photos))
 
 (defun flickr-get-by-keyword (keyword &optional (num-urls 6) (page 1))
   "Return a list of photo URLs matching keyword, using url_t directly."
   (let* ((result (flickr-call "flickr.photos.search"
                               "tags"     keyword
-			      "sort"	 "relevance"
-			      "content_types" "0" ; photos only, no screens/art
+                              "sort"     "relevance"
+                              "content_types" "0" ; photos only, no screens/art
                               "per_page" (write-to-string num-urls)
-			      "page"     (write-to-string page)))
+                              "page"     (write-to-string page)))
          (photos (cdr (assoc :photo
-			     (cdr (assoc :photos result))))))
+                             (cdr (assoc :photos result))))))
     photos))
     ;; ;; cl-json: "url_t" -> :URL--t
     ;; (mapcar (lambda (x) (cdr (assoc :url--t x))) photos)))
@@ -109,7 +113,7 @@
           do (format t "~& ~2D. ~A~%     ~A~%"
                      i
                      (cdr (assoc :title p))
-		     (form-photo-url p )))
+                     (form-photo-url p )))
     (length photos)))
 
 
@@ -124,7 +128,7 @@
 (defun fetch-puzzle-texture (renderer photo)
   "Download a Flickr image, load it into an SDL2 texture, return (texture w h)."
   (let* ((url     (form-photo-url photo))
-	 (surface (load-image-from-url url))
+         (surface (load-image-from-url url))
          (w       (sdl2:surface-width surface))
          (h       (sdl2:surface-height surface))
          (texture (sdl2:create-texture-from-surface renderer surface)))
@@ -136,16 +140,69 @@
 
 ;;; ── Fonts/Text ────────────────────────────────────────────────────────
 
-(defun render-text (renderer font text x y)
-  (unless (zerop (length text))
-    (let* ((surface (sdl2-ttf:render-utf8-solid font text 255 255 255 255))
-	   (w (sdl2:surface-width surface))
-	   (h (sdl2:surface-height surface))
-	   (texture (sdl2:create-texture-from-surface renderer surface)))
-      ;; XXX: should need this free, but get error here
-      ;;(sdl2:free-surface surface)
-      (sdl2:render-copy renderer texture
-			:dest-rect (sdl2:make-rect x y w h)))))
+(defun fetch-text-texture (renderer font title)
+  ;; Protect against title having a zero length
+  (let* ((text    (if (zerop (length title)) " " title))
+         (surface (sdl2-ttf:render-utf8-solid font text 255 255 255 255))
+         (w       (sdl2:surface-width surface))
+         (h       (sdl2:surface-height surface))
+         (texture (sdl2:create-texture-from-surface renderer surface)))
+    ;; Do NOT free surface -- sdl2-ttf registers a finalizer on it
+    ;; Just destroy the texture we created
+    ;;(sdl2:free-surface surface)
+
+    ;; XXX: Perhaps we should protect against w being > *cell-size* ??
+    (values texture w h)))
+
+
+;;; ── Cell Structure ────────────────────────────────────────────────────
+
+(defstruct cell
+  ix iy
+  img-texture
+  img-dest-rect
+  text-texture
+  text-dest-rect
+  photo)
+
+(defun cell-set-image (c renderer font photo)
+  (let ((ix (cell-ix c))
+        (iy (cell-iy c))
+        (title (cdr (assoc :title photo))))
+    (setf (cell-photo c) photo)
+    (let ((dest-x (+ (* ix *cell-size*) *cell-pad*))
+          (dest-y (+ (* iy *cell-size*) *cell-pad*)))
+      (when (cell-img-texture c)
+        (sdl2:destroy-texture (cell-img-texture c)))
+      (multiple-value-bind (tex w h)
+          (fetch-puzzle-texture renderer photo)
+        (setf (cell-img-texture c) tex)
+        (setf (cell-img-dest-rect c)
+              (sdl2:make-rect dest-x dest-y w h)))
+      (when (cell-text-texture c)
+        (sdl2:destroy-texture (cell-text-texture c)))
+      (multiple-value-bind (tex w h)
+          (fetch-text-texture renderer font title)
+        (let ((text-x dest-x)
+              (text-y (- dest-y 22)))
+          (setf (cell-text-texture c) tex)
+          (setf (cell-text-dest-rect c)
+                (sdl2:make-rect text-x text-y w h)))))))
+
+(defun render-cell (c renderer)
+  (when *debug*
+    (let((ix (cell-ix c))
+         (iy (cell-iy c))
+         (img-rect  (cell-img-dest-rect c))
+         (text-rect (cell-text-dest-rect c)))
+      (format t "[~d,~d] -> (~d ~d) + (~d ~d)~%"
+              ix iy
+              (sdl2:rect-x img-rect) (sdl2:rect-y img-rect)
+              (sdl2:rect-x text-rect) (sdl2:rect-y text-rect))))
+  (sdl2:render-copy renderer (cell-img-texture c)
+                    :dest-rect (cell-img-dest-rect c))
+  (sdl2:render-copy renderer (cell-text-texture c)
+                    :dest-rect (cell-text-dest-rect c)))
 
 
 ;;; ── Main ──────────────────────────────────────────────────────────────
@@ -154,30 +211,29 @@
   win
   renderer
   font
-  textures
-  photos
-  page)
+  cell-list
+  (page 1))
 
-(defun load-new-images (gs)
-  (when (game-state-textures gs)
-    (mapcar (lambda (x)
-	      (let ((tex (car x)))
-		(sdl2:destroy-texture tex)))
-	    (game-state-textures gs)))
-  (unless (game-state-page gs)
-    (setf (game-state-page gs) 1))
-  (let* ((renderer (game-state-renderer gs))
-	 (num-urls (* *num-rows* *num-cols*))
-	 (page (game-state-page gs))
-	 (photos (flickr-get-by-keyword *keyword* num-urls page)))
-    (setf (game-state-photos gs) photos)
-    ;; should have a list of triples (texture w h), 1 for each item in photos
-    (setf (game-state-textures gs)
-	  (mapcar (lambda (photo)
-		    (multiple-value-bind (tex w h)
-			(fetch-puzzle-texture renderer photo)
-		      (list tex w h)))
-		  photos))))
+;; initialize the cell-list hash table
+(defun make-cell-list (num-x num-y)
+  (loop for ix from 0 below num-x
+        nconcing (loop for iy from 0 below num-y
+                       collect (make-cell :ix ix :iy iy))))
+
+;; given a list of N photos, update all cells in cell-list
+(defun load-new-images (gs photos)
+  (let* ((cell-list (game-state-cell-list gs))
+         (renderer (game-state-renderer gs))
+         (font     (game-state-font gs)))
+    (loop for photo in photos
+          for c in cell-list
+          do (cell-set-image c renderer font photo))))
+
+(defun get-new-photos (page)
+  (let ((num-urls (* *num-rows* *num-cols*)))
+    ;; alternates:
+    ;;(flickr-get-interesting num-urls page)
+    (flickr-get-by-keyword *keyword* num-urls page)))
 
 
 (defun handle-keydown (gs keysym)
@@ -189,52 +245,33 @@
 
       ((sdl2:scancode= sc :scancode-r)
        (setf (game-state-page gs) 1)
-       (load-new-images gs))
+       (let ((photos (get-new-photos 1)))
+         (load-new-images gs photos)))
 
       ((sdl2:scancode= sc :scancode-n)
        ;; next N images
-       (setf (game-state-page gs) (+ (game-state-page gs) 1))
-       (load-new-images gs))
+       (let* ((page (+ (game-state-page gs) 1))
+              (photos (get-new-photos page)))
+         (setf (game-state-page gs) page)
+         (load-new-images gs photos)))
 
       ((sdl2:scancode= sc :scancode-p)
        ;; prev N images
-       (setf (game-state-page gs) (max 1 (- (game-state-page gs) 1)))
-       (load-new-images gs)))))
-
-
-(defun render-cell (renderer font ix iy tex-item photo)
-  (let* ((dest-x (+ (* ix *cell-size*) *cell-pad*))
-	 (dest-y (+ (* iy *cell-size*) *cell-pad*))
-	 (title  (cdr (assoc :title photo)))
-	 (text-x dest-x)
-	 (text-y (- dest-y 22))
-	 (texture (first tex-item))
-	 (img-w  (second tex-item))
-	 (img-h  (third tex-item)))
-    (sdl2:render-copy
-     renderer texture
-     :dest-rect (sdl2:make-rect dest-x dest-y img-w img-h))
-    ;;(format t "~a~%" title)
-    (render-text renderer font title text-x text-y)))
+       (let* ((page (- (game-state-page gs) 1))
+              (photos (get-new-photos page)))
+         (setf (game-state-page gs) page)
+         (load-new-images gs photos))))))
 
 
 (defun handle-idle (gs)
-  (let ((renderer (game-state-renderer gs))
-	(font     (game-state-font gs))
-        (textures (game-state-textures gs))
-	(photos   (game-state-photos gs)))
+  (let ((renderer  (game-state-renderer gs))
+        (cell-list (game-state-cell-list gs)))
     ;; maybe should have a flag for update-needed??
     (sdl2:set-render-draw-color renderer 0 0 0 255)
     (sdl2:render-clear renderer)
-    ;; helper list to loop over *num-rows* *num-cols* 
-    (let ((cells (loop for ix from 0 below *num-cols*
-		       nconcing (loop for iy from 0 below *num-rows*
-				      collect (cons ix iy)))))
-      ;; now iterate over these lists in parallel
-      (loop for cell in cells
-	    for tex-item in textures
-	    for pic in photos
-	    do (render-cell renderer font (car cell) (cdr cell) tex-item pic)))
+    ;; now iterate over these lists in parallel
+    (loop for cell in cell-list
+          do (render-cell cell renderer))
     (sdl2:render-present renderer)))
 
 
@@ -250,18 +287,24 @@
        (sdl2-image:quit)
        (sdl2-ttf:quit))))
 
+
 (defun main ()
   (let ((window-w (* *num-cols* *cell-size*))
-	(window-h (* *num-rows* *cell-size*)))
+        (window-h (* *num-rows* *cell-size*)))
     (with-sdl2-game (win renderer "Image Puzzle" window-w window-h)
       (let* ((font (sdl2-ttf:open-font *font-file* *font-size*))
-	     (gs (make-game-state :win win :renderer renderer :font font)))
-	(load-new-images gs)
-	(sdl2:with-event-loop (:method :poll)
-          (:quit () t)
-          (:keydown (:keysym keysym) (handle-keydown gs keysym))
-          (:idle () (handle-idle gs)
-		    (sdl2:delay *idle-delay*)))))))
+             (gs (make-game-state :win win :renderer renderer :font font)))
+        (unwind-protect
+             (progn
+               (setf (game-state-cell-list gs)
+                     (make-cell-list *num-cols* *num-rows*))
+               (load-new-images gs (get-new-photos 1))
+               (sdl2:with-event-loop (:method :poll)
+                 (:quit () t)
+                 (:keydown (:keysym keysym) (handle-keydown gs keysym))
+                 (:idle () (handle-idle gs)
+                        (sdl2:delay *idle-delay*))))
+          (sdl2-ttf:close-font font))))))
 
 ;; run the program
 (main)
