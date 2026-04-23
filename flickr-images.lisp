@@ -9,20 +9,19 @@
 
 
 ;;; ── Constants ─────────────────────────────────────────────────────────
-(defparameter *max-size* 800)
 (defparameter *num-rows* 2)
 (defparameter *num-cols* 3)
 (defparameter *cell-size* 350)
 (defparameter *cell-pad* 40)
-(defparameter *idle-delay* 500)         ; pause in ms
+(defparameter *idle-delay* 100)         ; pause in ms
 
 (defparameter *font-file*
   "/usr/share/fonts/urw-base35/NimbusSansNarrow-Regular.otf")
 (defparameter *font-size* 18)
 
 ;;(defparameter *keyword* "tiger")
-;;(defparameter *keyword* "cat")
-(defparameter *keyword* "kitty")
+(defparameter *keyword* "cat")
+;;(defparameter *keyword* "kitty")
 (defparameter *image-size* "m")   ; t = 100, m = 240, q = 150 sq, b = 1024
 
 (defparameter *debug* nil)
@@ -74,12 +73,6 @@
           (cdr (assoc :secret photo))
           size))
 
-(defun get-random-url (photos &optional (size *image-size*))
-  "Choose a random pic from list of returned photo prop-lists"
-  (form-photo-url (nth (random (length photos)) photos) size))
-
-;; Use like this:
-;; (get-random-url (flickr-get-interesting 6) "t")
 
 (defun flickr-get-interesting (&optional (num-urls 10) (page 1))
   "Return a random photo URL from Flickr interestingness."
@@ -103,18 +96,6 @@
     photos))
     ;; ;; cl-json: "url_t" -> :URL--t
     ;; (mapcar (lambda (x) (cdr (assoc :url--t x))) photos)))
-
-(defun flickr-debug-search (keyword &optional (num-urls 10))
-  "Show all photo titles and URLs returned for a keyword search."
-  (let ((photos (flickr-get-by-keyword keyword num-urls)))
-    (format t "~&Found ~A photos for keyword: ~S~%" (length photos) keyword)
-    (loop for p in photos
-          for i from 1
-          do (format t "~& ~2D. ~A~%     ~A~%"
-                     i
-                     (cdr (assoc :title p))
-                     (form-photo-url p )))
-    (length photos)))
 
 
 ;;; ── Image loading ─────────────────────────────────────────────────────
@@ -143,15 +124,13 @@
 (defun fetch-text-texture (renderer font title)
   ;; Protect against title having a zero length
   (let* ((text    (if (zerop (length title)) " " title))
-         (surface (sdl2-ttf:render-utf8-solid font text 255 255 255 255))
+         (surface (sdl2-ttf:render-utf8-blended font text 255 255 255 255))
          (w       (sdl2:surface-width surface))
          (h       (sdl2:surface-height surface))
          (texture (sdl2:create-texture-from-surface renderer surface)))
     ;; Do NOT free surface -- sdl2-ttf registers a finalizer on it
     ;; Just destroy the texture we created
     ;;(sdl2:free-surface surface)
-
-    ;; XXX: Perhaps we should protect against w being > *cell-size* ??
     (values texture w h)))
 
 
@@ -162,6 +141,7 @@
   img-texture
   img-dest-rect
   text-texture
+  text-src-rect
   text-dest-rect
   photo)
 
@@ -184,10 +164,31 @@
       (multiple-value-bind (tex w h)
           (fetch-text-texture renderer font title)
         (let ((text-x dest-x)
-              (text-y (- dest-y 22)))
+              (text-y (- dest-y 22))
+              ;; Protect against w being too long
+              (text-limit (- *cell-size* (* 2 *cell-pad*))))
           (setf (cell-text-texture c) tex)
-          (setf (cell-text-dest-rect c)
-                (sdl2:make-rect text-x text-y w h)))))))
+          (if (> w text-limit)
+              (setf (cell-text-src-rect c)
+                    (sdl2:make-rect 0 0 text-limit h)
+                    (cell-text-dest-rect c)
+                    (sdl2:make-rect text-x text-y text-limit h))
+              (setf (cell-text-src-rect c) nil
+                    (cell-text-dest-rect c)
+                    (sdl2:make-rect text-x text-y w h))))))))
+
+(defun cell-clear-image (c)
+  "Reset cell to nil values if not enough photos returned"
+  (when (cell-img-texture c)
+    (sdl2:destroy-texture (cell-img-texture c))
+    (setf (cell-img-texture c) nil))
+  (when (cell-text-texture c)
+    (sdl2:destroy-texture (cell-text-texture c))
+    (setf (cell-text-texture c) nil))
+  (setf (cell-img-dest-rect  c) nil
+        (cell-text-src-rect c)  nil
+        (cell-text-dest-rect c) nil
+        (cell-photo          c) nil))
 
 (defun render-cell (c renderer)
   (when *debug*
@@ -199,10 +200,13 @@
               ix iy
               (sdl2:rect-x img-rect) (sdl2:rect-y img-rect)
               (sdl2:rect-x text-rect) (sdl2:rect-y text-rect))))
-  (sdl2:render-copy renderer (cell-img-texture c)
-                    :dest-rect (cell-img-dest-rect c))
-  (sdl2:render-copy renderer (cell-text-texture c)
-                    :dest-rect (cell-text-dest-rect c)))
+  (when (cell-img-texture c)
+    (sdl2:render-copy renderer (cell-img-texture c)
+                      :dest-rect (cell-img-dest-rect c)))
+  (when (cell-text-texture c)
+    (sdl2:render-copy renderer (cell-text-texture c)
+                      :source-rect (cell-text-src-rect c)
+                      :dest-rect (cell-text-dest-rect c))))
 
 
 ;;; ── Main ──────────────────────────────────────────────────────────────
@@ -212,22 +216,34 @@
   renderer
   font
   cell-list
-  (page 1))
+  (page 1)
+  (dirty t))
 
-;; initialize the cell-list hash table
 (defun make-cell-list (num-x num-y)
+  "Initialize a cell-list based on ix,iy positions"
   (loop for ix from 0 below num-x
         nconcing (loop for iy from 0 below num-y
                        collect (make-cell :ix ix :iy iy))))
 
-;; given a list of N photos, update all cells in cell-list
 (defun load-new-images (gs photos)
+  "Update all cells in cell-list based on new photos list"
   (let* ((cell-list (game-state-cell-list gs))
-         (renderer (game-state-renderer gs))
-         (font     (game-state-font gs)))
+         (renderer  (game-state-renderer gs))
+         (font      (game-state-font gs)))
+    ;; Load available photos into cells
     (loop for photo in photos
           for c in cell-list
-          do (cell-set-image c renderer font photo))))
+          do (cell-set-image c renderer font photo))
+    ;; Clear any remaining cells if photos list happens to be short
+    (loop for c in (nthcdr (length photos) cell-list)
+          do (cell-clear-image c))
+    (setf (game-state-dirty gs) t)))
+
+(defun update-window-title (gs)
+  (sdl2:set-window-title
+   (game-state-win gs)
+   (format nil "Flickr: ~A  (page ~d)" *keyword* (game-state-page gs))))
+
 
 (defun get-new-photos (page)
   (let ((num-urls (* *num-rows* *num-cols*)))
@@ -246,6 +262,7 @@
       ((sdl2:scancode= sc :scancode-r)
        (setf (game-state-page gs) 1)
        (let ((photos (get-new-photos 1)))
+         (update-window-title gs)
          (load-new-images gs photos)))
 
       ((sdl2:scancode= sc :scancode-n)
@@ -253,26 +270,30 @@
        (let* ((page (+ (game-state-page gs) 1))
               (photos (get-new-photos page)))
          (setf (game-state-page gs) page)
+         (update-window-title gs)
          (load-new-images gs photos)))
 
       ((sdl2:scancode= sc :scancode-p)
        ;; prev N images
-       (let* ((page (- (game-state-page gs) 1))
+       (let* ((page (max 1 (- (game-state-page gs) 1)))
               (photos (get-new-photos page)))
          (setf (game-state-page gs) page)
+         (update-window-title gs)
          (load-new-images gs photos))))))
 
-
 (defun handle-idle (gs)
-  (let ((renderer  (game-state-renderer gs))
-        (cell-list (game-state-cell-list gs)))
-    ;; maybe should have a flag for update-needed??
-    (sdl2:set-render-draw-color renderer 0 0 0 255)
-    (sdl2:render-clear renderer)
-    ;; now iterate over these lists in parallel
-    (loop for cell in cell-list
-          do (render-cell cell renderer))
-    (sdl2:render-present renderer)))
+  ;; only redraw if updated
+  (when (game-state-dirty gs)
+    (let ((renderer  (game-state-renderer gs))
+          (cell-list (game-state-cell-list gs)))
+      (sdl2:set-render-draw-color renderer 0 0 0 255)
+      (sdl2:render-clear renderer)
+      ;; draw each image/label in cell-list
+      (loop for cell in cell-list
+            do (when (cell-img-texture cell)
+                 (render-cell cell renderer)))
+      (sdl2:render-present renderer)
+      (setf (game-state-dirty gs) nil))))
 
 
 ;; SDL boilerplate
@@ -299,6 +320,7 @@
                (setf (game-state-cell-list gs)
                      (make-cell-list *num-cols* *num-rows*))
                (load-new-images gs (get-new-photos 1))
+               (update-window-title gs)
                (sdl2:with-event-loop (:method :poll)
                  (:quit () t)
                  (:keydown (:keysym keysym) (handle-keydown gs keysym))
