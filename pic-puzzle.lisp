@@ -15,11 +15,13 @@
 (defparameter *idle-delay* 50)          ;pause in ms
 
 ;;(defparameter *keyword* "tiger")
-(defparameter *keyword* "cat")
-;;(defparameter *keyword* "kitty")
+;;(defparameter *keyword* "cat")
+(defparameter *keyword* "kitty")
+;;(defparameter *keyword* nil)          ;use interestingness query
+
 (defparameter *num-urls* 20)
-(defparameter *image-size* "b")   ; z=640, c=800, b=1024, h=1600
-(defparameter *debug-image* nil)   ; set to a path string to bypass Flickr
+(defparameter *image-size* "b")         ; z=640, c=800, b=1024, h=1600
+(defparameter *debug-image* nil)        ; set to a path string to bypass Flickr
 
 (defparameter *border-off*   5)
 (defparameter *border-on*   10)
