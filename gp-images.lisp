@@ -8,11 +8,13 @@
 
 
 ;;; ── Constants ──────────────────────────────────────────────────────────────
-(defparameter *tile-w*        100)
-(defparameter *tile-h*        100)
-(defparameter *border*        5)
 (defparameter *thumb-cols*    4)
 (defparameter *thumb-rows*    3)
+(defparameter *thumb-w*       100)
+(defparameter *thumb-h*       100)
+(defparameter *border*        5)
+(defparameter *tile-w*        (+ *thumb-w* (* 2 *border*)))
+(defparameter *tile-h*        (+ *thumb-h* (* 2 *border*)))
 (defparameter *max-depth*     6)    ; max initial tree depth
 (defparameter *min-depth*     2)    ; min initial tree depth
 
@@ -205,7 +207,7 @@
   (let ((dest (sdl2:make-rect (+ (* ix tile-w) border)
                               (+ (* iy tile-h) border)
                               (- tile-w (* 2 border))
-			      (- tile-h (* 2 border)))))
+                              (- tile-h (* 2 border)))))
     (sdl2:render-copy renderer texture :dest-rect dest)))
 
 
@@ -235,12 +237,34 @@
   (mapc #'free-individual pop))
 
 
+;;; ── State struct ───────────────────────────────────────────────────────────
+(defstruct state
+  pop
+  renderer
+  (dirty t))
+
+;; implicit defun of (make-state :pop pop :renderer renderer :dirty t)
+
+(defun free-state (state)
+  (free-population (state-pop state)))
+
+(defun replace-tile (state ix iy)
+  "Generate new image for the slot at ix,iy"
+  (let ((renderer (state-renderer state))
+        (pop      (state-pop state))
+        (idx      (+ (* iy *thumb-cols*) ix)))
+    (free-individual (nth idx pop))
+    (setf (nth idx pop)
+          (make-genome renderer *thumb-w* *thumb-h*))
+    (setf (state-dirty state) t)))
+
+
 ;;; ── Event loop functions  ──────────────────────────────────────────────────
 (defun handle-keydown (state keysym)
   (let ((sc       (sdl2:scancode-value keysym))
         (pop-size (* *thumb-cols* *thumb-rows*))
-	(renderer (cdr (assoc :renderer state)))
-	(pop      (cdr (assoc :pop state))))
+        (renderer (state-renderer state))
+        (pop      (state-pop state)))
     (cond
       ;; Q or Escape: quit
       ((or (sdl2:scancode= sc :scancode-escape)
@@ -251,73 +275,65 @@
       ((sdl2:scancode= sc :scancode-r)
        (format t "~&Regenerating population...~%")
        (free-population pop)
-       (setf (cdr (assoc :pop state))
-	     (make-population renderer pop-size *tile-w* *tile-h*)
-             (cdr (assoc :dirty state))
-	     t))
+       (setf (state-pop state)
+             (make-population renderer pop-size *thumb-w* *thumb-h*)
+             (state-dirty state)
+             t))
 
       ;; Space: regenerate a single random individual
       ((sdl2:scancode= sc :scancode-space)
-       (let ((idx (random pop-size)))
-         (free-individual (nth idx pop))
-         (setf (nth idx pop)
-               (make-genome renderer *tile-w* *tile-h*))
-         (setf (cdr (assoc :dirty state)) t))) )))
+       (let ((ix (random *thumb-cols*))
+	     (iy (random *thumb-rows*)))
+	 (replace-tile state ix iy))) )))
+
 
 (defun handle-mouse (state x y button)
   (when (= button sdl2-ffi:+sdl-button-left+)
-    (let* ((tile-w (+ *tile-w* (* 2 *border*)))
-	   (tile-h (+ *tile-h* (* 2 *border*)))
-	   (ix (truncate x tile-w))
-	   (iy (truncate y tile-h)))
-    (format t "Mouse click: ~a ~a ==> ~a ~a~%" x y ix iy))))
+    (let* ((ix       (truncate x *tile-w*))
+           (iy       (truncate y *tile-h*)))
+      (format t "Mouse click: ~a ~a ==> ~a ~a~%" x y ix iy)
+      (replace-tile state ix iy))))
 
 (defun handle-idle (state)
-  (when (cdr (assoc :dirty state))
-    (let ((renderer (cdr (assoc :renderer state)))
-	  (pop      (cdr (assoc :pop state))))
-    (sdl2:set-render-draw-color renderer 20 20 20 255)
-    (sdl2:render-clear renderer)
-    (loop for ind in pop
-          for i from 0
-          do (let ((ix (mod i *thumb-cols*))
-                   (iy (truncate i *thumb-cols*)))
-               (render-thumbnail renderer
-                                 (individual-texture ind)
-                                 ix iy
-				 (+ *tile-w* (* 2 *border*))
-				 (+ *tile-h* (* 2 *border*))
-				 *border*)))
-    (sdl2:render-present renderer)
-    (setf (cdr (assoc :dirty state)) nil)))
+  (when (state-dirty state)
+    (let ((renderer (state-renderer state))
+          (pop      (state-pop state)))
+      (sdl2:set-render-draw-color renderer 20 20 20 255)
+      (sdl2:render-clear renderer)
+      (loop for ind in pop
+            for i from 0
+            do (let ((ix (mod i *thumb-cols*))
+                     (iy (truncate i *thumb-cols*)))
+		 (render-thumbnail renderer
+                                   (individual-texture ind)
+                                   ix iy *tile-w* *tile-h* *border*)))
+      (sdl2:render-present renderer)
+      (setf (state-dirty state) nil)))
   (sdl2:delay 16))
 
 
 ;;; ── Main ───────────────────────────────────────────────────────────────────
 (defun main ()
   ;; calc screen-width / screen-height
-  (let ((screen-width  (* *thumb-cols* (+ *tile-w* (* 2 *border*))))
-	(screen-height (* *thumb-rows* (+ *tile-h* (* 2 *border*)))))
+  (let ((screen-width  (* *thumb-cols* *tile-w*))
+        (screen-height (* *thumb-rows* *tile-h*)))
     (sdl2:with-init (:video)
       (sdl2:with-window (win :title "GP Image Explorer"
                              :w screen-width :h screen-height
                              :flags '(:shown))
-	(sdl2:with-renderer (renderer win :flags '(:accelerated))
+        (sdl2:with-renderer (renderer win :flags '(:accelerated))
           (let* ((pop-size (* *thumb-cols* *thumb-rows*))
-		 (pop      (make-population renderer pop-size *tile-w* *tile-h*))
-		 (state    (list (cons :renderer renderer)
-				 (cons :pop pop)
-				 (cons :dirty t))))
+                 (pop      (make-population renderer pop-size *tile-w* *tile-h*))
+                 (state    (make-state :renderer renderer :pop pop)))
+            (sdl2:with-event-loop (:method :poll)
+              (:quit () t)
+              (:keydown (:keysym keysym) (handle-keydown state keysym))
+              (:mousebuttondown (:x x :y y :button button)
+				(handle-mouse state x y button))
+              (:idle () (handle-idle state)))
 
-          (sdl2:with-event-loop (:method :poll)
-            (:quit () t)
-            (:keydown (:keysym keysym) (handle-keydown state keysym))
-	    (:mousebuttondown (:x x :y y :button button)
-			      (handle-mouse state x y button))
-            (:idle () (handle-idle state)))
-
-          (free-population (cdr (assoc :pop state)))
-	  t))))))			;return t instead of pop list
+            (free-state state)
+            t))))))                       ;return t instead of pop list
 
 ;; Print a sample genome to the REPL for inspection
 ;;(format t "~&Sample genome:~%~S~%~%" (make-rgb-genome))
