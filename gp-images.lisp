@@ -18,10 +18,16 @@
 (defparameter *multi-sel-color* '(150 150 150))
 (defparameter *tile-w*          (+ *thumb-w* (* 2 *border*)))
 (defparameter *tile-h*          (+ *thumb-h* (* 2 *border*)))
+(defparameter *idle-delay*      50)   ;pause in ms
+
+;;; GP/Evolution params;
 (defparameter *max-depth*       6)    ; max initial tree depth
 (defparameter *min-depth*       2)    ; min initial tree depth
-(defparameter *mutation-rate*   0.01)
-(defparameter *idle-delay*      50)   ;pause in ms
+(defparameter *max-nodes*       150)   ; discard offspring larger than this
+;;Mutation rate scales inversely with tree size (Sims' key insight)
+(defparameter *base-mutation-rate*  0.08)
+(defparameter *const-adjust-prob*   0.3)   ; prob of nudging a constant vs replacing
+(defparameter *const-adjust-amount* 0.3)   ; max nudge magnitude
 
 
 ;;; ── GP Function and Terminal Sets ──────────────────────────────────────────
@@ -33,26 +39,25 @@
 ;; Function set: (name arity)
 ;; Terminal set: x, y, random constants in [-1,1]
 (defparameter *functions*
-  '((+        2)
-    (-        2)
-    (*        2)
-    (div-safe 2)    ; protected division
-    (sin-pi   1)    ; sin(pi * x) -- more interesting than plain sin
-    (cos-pi   1)
-    (abs-val  1)
-    (negate   1)
-    (mod-safe 2)    ; protected mod
-    (expt-safe 2)   ; protected expt
-    (min-val  2)
-    (max-val  2)
-    (if-pos   3)    ; (if-pos condition then else)
-    (mix      3)    ; linear interp: mix(a,b,t) = a*(1-t) + b*t
-    (warp     3)))  ; domain warp: eval subtree at (x+dx, y+dy)
+  '((+         2)
+    (-         2)
+    (*         2)
+    (div-safe  2)    ; protected division
+    (sin-pi    1)    ; sin(pi * x) -- more interesting than plain sin
+    (cos-pi    1)
+    (abs-val   1)
+    (negate    1)
+    (mod-safe  2)    ; protected mod
+    (expt-safe 2)    ; protected expt
+    (min-val   2)
+    (max-val   2)
+    (if-pos    3)    ; (if-pos condition then else)
+    (mix       3)    ; linear interp: mix(a,b,t) = a*(1-t) + b*t
+    (warp      3)))  ; domain warp: eval subtree at (x+dx, y+dy)
 
-(defparameter *terminals*
-  '(x y))
+(defparameter *terminals*         '(x y))
+(defparameter *const-probability*  0.3)   ; probability a terminal is a constant
 
-(defparameter *const-probability* 0.3)   ; probability a terminal is a constant
 
 
 ;;; ── Safe math primitives ───────────────────────────────────────────────────
@@ -68,15 +73,14 @@
 (defun mod-safe (a b)
   (if (< (abs b) 1e-6) 0.0 (clamp (mod a (+ (abs b) 1e-6)))))
 
-(defun expt-safe (base exp)
-  (clamp (if (and (< base 0) (/= (round exp) exp))
-             0.0
-             (expt (clamp base) (clamp exp)))))
+(defun expt-safe (base e)
+  (clamp (if (and (< base 0) (/= (round e) e)) 0.0
+             (expt (clamp base) (clamp e)))))
 
-(defun sin-pi (x)  (sin  (* pi x)))
-(defun cos-pi (x)  (cos  (* pi x)))
-(defun abs-val (x) (abs x))
-(defun negate  (x) (- x))
+(defun sin-pi  (x)   (sin (* pi x)))
+(defun cos-pi  (x)   (cos (* pi x)))
+(defun abs-val (x)   (abs x))
+(defun negate  (x)   (- x))
 (defun min-val (a b) (min a b))
 (defun max-val (a b) (max a b))
 
@@ -112,8 +116,8 @@
   (cond
     ;; Must go deeper -- never return terminal yet
     ((> min-depth 0)
-     (let* ((fn   (random-function))
-            (name (first fn))
+     (let* ((fn    (random-function))
+            (name  (first fn))
             (arity (second fn)))
        (cons name (loop repeat arity
                         collect (random-expr (1- max-depth)
@@ -137,17 +141,251 @@
         (random-expr)
         (random-expr)))
 
-(defun mutate (expr)
-  "Replace a random subtree with a new random expression."
-  (if (or (atom expr) (< (random 1.0) *mutation-rate*))
-      (random-expr *max-depth*)
-      (cons (car expr)
-            (mapcar #'mutate (cdr expr)))))
+(defun count-nodes (expr)
+  (if (atom expr) 1
+      (1+ (reduce #'+ (mapcar #'count-nodes (cdr expr))))))
 
-;; (defun crossover (expr1 expr2)
-;;   "Swap a random subtree from expr2 into expr1."
-;;   (let ((subtree (random-subtree expr2)))
-;;     (replace-random-subtree expr1 subtree)))
+
+;;; ── Tree utilities ─────────────────────────────────────────────────────────
+(defun collect-nodes (expr)
+  "Return a flat list of all subtrees (including atoms) in expr."
+  (if (atom expr)
+      (list expr)
+      (cons expr (mapcan #'collect-nodes (cdr expr)))))
+
+(defun random-subtree (expr)
+  "Pick a uniformly random subtree from expr."
+  (let ((nodes (collect-nodes expr)))
+    (when nodes
+      (nth (random (length nodes)) nodes))))
+
+(defun function-arity (name)
+  (let ((entry (assoc name *functions*)))
+    (when entry
+      (second entry))))
+
+(defun random-other-function (current-name current-arity)
+  "Return a random function name with same arity, different from current."
+  (let ((candidates (loop for (name arity) in *functions*
+                          when (and (= arity current-arity)
+                                    (not (eq name current-name)))
+                          collect name)))
+    (when candidates
+      (nth (random (length candidates)) candidates))))
+
+
+;;; ── Mutation ───────────────────────────────────────────────────────────────
+;;
+;; Implements all 7 of Sims' mutation types.
+;; Per-node rate scales inversely with parent tree size.
+
+(defun mutate-expr (expr parent-size)
+  "Mutate an expression, using a rate scaled by parent-size."
+  (let ((rate (/ *base-mutation-rate* (max 1.0 (/ parent-size 10.0)))))
+    (labels ((mut (e depth)
+               (cond
+                 ;; Type 1: replace entire node with new random subtree
+                 ((< (random 1.0) rate)
+                  (random-expr (max 1 (- *max-depth* depth)) 0))
+
+                 ;; Atom (terminal)
+                 ((atom e)
+                  (cond
+                    ;; Type 2: nudge a numeric constant
+                    ((numberp e)
+                     (if (< (random 1.0) *const-adjust-prob*)
+                         (clamp (+ e (* *const-adjust-amount*
+                                        (- (random 2.0) 1.0))))
+                         e))
+                    (t e)))
+
+                 ;; Compound node
+                 ((consp e)
+                  (let* ((fname (car e))
+                         (fargs (cdr e))
+                         (arity (length fargs)))
+                    (cond
+                      ;; Type 4: change function to another with same arity
+                      ((< (random 1.0) rate)
+                       (let ((new-fn (random-other-function fname arity)))
+                         (cons (or new-fn fname)
+                               (mapcar (lambda (a) (mut a (1+ depth))) fargs))))
+
+                      ;; Type 5: wrap node inside a new random function
+                      ((< (random 1.0) (* rate 0.5))
+                       (let* ((new-fn    (random-function))
+                              (new-name  (first  new-fn))
+                              (new-arity (second new-fn))
+                              (pos       (random new-arity)))
+                         (cons new-name
+                               (loop for i below new-arity
+                                     collect (if (= i pos) e (random-terminal))))))
+
+                      ;; Type 6: one argument replaces the whole node (inverse of 5)
+                      ((< (random 1.0) (* rate 0.5))
+                       (mut (nth (random arity) fargs) depth))
+
+                      ;; Type 7: copy a sibling subtree into this position
+                      ((< (random 1.0) (* rate 0.3))
+                       (let ((other (random-subtree e)))
+                         (if other other
+                             (cons fname (mapcar (lambda (a) (mut a (1+ depth)))
+                                                 fargs)))))
+
+                      ;; Default: recurse into children
+                      (t
+                       (cons fname (mapcar (lambda (a) (mut a (1+ depth)))
+                                           fargs)))))))))
+      (mut expr 0))))
+
+(defun mutate-genome (genome)
+  "Mutate all three channels; discard any channel that grows too large."
+  (let ((size (reduce #'+ (mapcar #'count-nodes genome))))
+    (loop for channel in genome
+          collect (let ((m (mutate-expr channel size)))
+                    (if (> (count-nodes m) *max-nodes*) channel m)))))
+
+
+;;; ── Crossover ──────────────────────────────────────────────────────────────
+;;
+;; Sims: "A node in expr1 is chosen at random and replaced by a node
+;; chosen at random from expr2."
+(defun replace-one-node (expr replacement)
+  "Replace exactly one randomly chosen node in expr with replacement.
+   Returns (values new-expr did-replace?)."
+  (cond
+    ;; Atom: replace with some probability
+    ((atom expr)
+     (if (< (random 1.0) 0.3)
+         (values replacement t)
+         (values expr nil)))
+    ;; Compound
+    ((consp expr)
+     (if (< (random 1.0) 0.15)
+         (values replacement t)
+         ;; Try to replace in exactly one child, left to right
+         (let ((new-args nil) (replaced nil))
+           (dolist (arg (cdr expr))
+             (if replaced
+                 (push arg new-args)
+                 (multiple-value-bind (new-arg did-it)
+                     (replace-one-node arg replacement)
+                   (push new-arg new-args)
+                   (setf replaced did-it))))
+           (values (cons (car expr) (nreverse new-args)) replaced))))))
+
+(defun crossover-expr (expr1 expr2)
+  "Sims crossover: graft a random subtree of expr2 into expr1."
+  (let* ((subtree (random-subtree expr2))
+         (result  (replace-one-node expr1 subtree)))
+    (if (> (count-nodes result) *max-nodes*) expr1 result)))
+
+(defun crossover-genomes (genome1 genome2)
+  "Crossover channel by channel."
+  (loop for ch1 in genome1
+        for ch2 in genome2
+        collect (crossover-expr ch1 ch2)))
+
+
+;;; ── Genetic Dissolve ───────────────────────────────────────────────────────
+;;
+;; Sims: copy identical nodes, wrap differing ones in (mix e1 e2 alpha).
+;; Varying alpha 0->1 produces a smooth animation between two parent images.
+(defun dissolve-expr (expr1 expr2 alpha)
+  "Build a dissolved expression at blend alpha in [0.0, 1.0]."
+  (cond
+    ((equal expr1 expr2)
+     expr1)
+    ((and (atom expr1) (atom expr2))
+     `(mix ,expr1 ,expr2 ,alpha))
+    ((and (consp expr1) (consp expr2)
+          (eq (car expr1) (car expr2))
+          (= (length expr1) (length expr2)))
+     (cons (car expr1)
+           (mapcar (lambda (a b) (dissolve-expr a b alpha))
+                   (cdr expr1) (cdr expr2))))
+    (t
+     `(mix ,expr1 ,expr2 ,alpha))))
+
+(defun dissolve-genomes (genome1 genome2 alpha)
+  (loop for ch1 in genome1
+        for ch2 in genome2
+        collect (dissolve-expr ch1 ch2 alpha)))
+
+
+;;; ── Breeding ───────────────────────────────────────────────────────────────
+(defun breed-offspring (parent-genomes)
+  "Produce one child from 1 or more parents."
+  (if (= (length parent-genomes) 1)
+      (mutate-genome (first parent-genomes))
+      (let* ((p1    (nth (random (length parent-genomes)) parent-genomes))
+             (p2    (nth (random (length parent-genomes)) parent-genomes))
+             (child (crossover-genomes p1 p2)))
+        (mutate-genome child))))
+
+(defun evolve-population (state)
+  "Replace non-selected slots with offspring; selected individuals survive."
+  (let* ((pop      (state-pop state))
+         (renderer (state-renderer state))
+         (selected (state-selected state)))
+    (when (null selected)
+      ;; or maybe just mutate each cell??
+      (format t "~&No parents selected -- click images first, then press E.~%")
+      (return-from evolve-population nil))
+    (let ((parent-genomes
+           (loop for pos in selected
+                 collect (individual-genome
+                          (nth (+ (* (cdr pos) *thumb-cols*) (car pos)) pop)))))
+      (format t "~&Breeding ~A offspring from ~A parent(s)...~%"
+              (- (* *thumb-cols* *thumb-rows*) (length selected))
+              (length parent-genomes))
+      (loop for ind in pop
+            for i from 0
+            do (unless (individual-selected ind)
+                 (let* ((child   (breed-offspring parent-genomes))
+                        (pixels  (eval-genome-to-pixels child *thumb-w* *thumb-h*))
+                        (texture (pixels-to-texture renderer pixels *thumb-w* *thumb-h*)))
+                   (free-individual ind)
+                   (setf (nth i (state-pop state))
+                         (make-individual :genome child :texture texture
+                                          :pixels pixels)))))
+      (clear-selected state)
+      (setf (state-dirty state) t)
+      (format t "~&Evolution complete.~%"))))
+
+(defun dissolve-selected (state)
+  "Fill non-selected slots with dissolve steps between exactly 2 parents."
+  (let* ((selected (state-selected state))
+         (pop      (state-pop state))
+         (renderer (state-renderer state)))
+    (unless (= (length selected) 2)
+      (format t "~&Dissolve requires exactly 2 selected images (currently ~A selected).~%"
+              (length selected))
+      (return-from dissolve-selected nil))
+    (let* ((pos1    (first  selected))
+           (pos2    (second selected))
+           (genome1 (individual-genome
+                     (nth (+ (* (cdr pos1) *thumb-cols*) (car pos1)) pop)))
+           (genome2 (individual-genome
+                     (nth (+ (* (cdr pos2) *thumb-cols*) (car pos2)) pop)))
+           (n-steps (- (* *thumb-cols* *thumb-rows*) 2))
+           (step    0))
+      (format t "~&Dissolving in ~A steps...~%" n-steps)
+      (loop for ind in pop
+            for i from 0
+            do (unless (individual-selected ind)
+                 (incf step)
+                 (let* ((alpha   (/ (float step) (1+ n-steps)))
+                        (child   (dissolve-genomes genome1 genome2 alpha))
+                        (pixels  (eval-genome-to-pixels child *thumb-w* *thumb-h*))
+                        (texture (pixels-to-texture renderer pixels *thumb-w* *thumb-h*)))
+                   (free-individual ind)
+                   (setf (nth i (state-pop state))
+                         (make-individual :genome child :texture texture
+                                          :pixels pixels)))))
+      (clear-selected state)
+      (setf (state-dirty state) t)
+      (format t "~&Dissolve complete.~%"))))
 
 
 ;;; ── Genome Evaluation ──────────────────────────────────────────────────────
@@ -175,10 +413,10 @@
                        (clamp (+ y dy)))))
          ;; All other functions: evaluate args then apply
          (otherwise
-          (let ((evaled (mapcar (lambda (a) (eval-expr a x y)) args)))
-            (clamp (apply fn evaled)))))))
+          (clamp (apply fn (mapcar (lambda (a) (eval-expr a x y)) args)))))))
 
-    (t 0.0)))  ; fallback for anything unexpected
+    ;; fallback for anything unexpected
+    (t 0.0)))
 
 (defun value-to-byte (v)
   "Convert a [-1,1] float to a [0,255] byte."
@@ -196,11 +434,11 @@
     (dotimes (py height)
       (dotimes (px width)
         ;; Normalize pixel coords to [-1, 1]
-        (let* ((x  (- (* 2.0 (/ px (float (1- width))))  1.0))
-               (y  (- (* 2.0 (/ py (float (1- height)))) 1.0))
-               (r  (value-to-byte (eval-expr r-expr x y)))
-               (g  (value-to-byte (eval-expr g-expr x y)))
-               (b  (value-to-byte (eval-expr b-expr x y)))
+        (let* ((x   (- (* 2.0 (/ px (float (1- width))))  1.0))
+               (y   (- (* 2.0 (/ py (float (1- height)))) 1.0))
+               (r   (value-to-byte (eval-expr r-expr x y)))
+               (g   (value-to-byte (eval-expr g-expr x y)))
+               (b   (value-to-byte (eval-expr b-expr x y)))
                (idx (* 3 (+ (* py width) px))))
           (setf (aref pixels idx)       r
                 (aref pixels (+ idx 1)) g
@@ -219,22 +457,21 @@
       (sdl2:update-texture texture nil ptr (* width 3)))
     texture))
 
-(defun render-thumbnail (renderer texture ix iy selected-color
+(defun render-thumbnail (renderer texture ix iy sel-color
                          tile-w tile-h border) ;these could be constants
   "Blit a thumbnail texture to grid position (ix, iy)."
-  (let* ((x (* ix tile-w))
-         (y (* iy tile-h))
-         (outer-rect (sdl2:make-rect x y tile-w tile-h))
-         (inner-rect (sdl2:make-rect (+ x border) (+ y border)
-                                     (- tile-w (* 2 border))
-                                     (- tile-h (* 2 border)))))
-    ;;(format t "render ~a,~a - ~a~%" ix iy selected-color)
+  (let* ((x     (* ix tile-w))
+         (y     (* iy tile-h))
+         (outer (sdl2:make-rect x y tile-w tile-h))
+         (inner (sdl2:make-rect (+ x border) (+ y border)
+                                (- tile-w (* 2 border))
+                                (- tile-h (* 2 border)))))
     ;; first render the border, depending on selected state
-    (when selected-color
+    (when sel-color
       (sdl2:set-render-draw-color renderer
-        (first selected-color) (second selected-color) (third selected-color) 255)
-      (sdl2:render-fill-rect renderer outer-rect))
-    (sdl2:render-copy renderer texture :dest-rect inner-rect)))
+        (first sel-color) (second sel-color) (third sel-color) 255)
+      (sdl2:render-fill-rect renderer outer))
+    (sdl2:render-copy renderer texture :dest-rect inner)))
 
 
 ;;; ── Population ─────────────────────────────────────────────────────────────
@@ -244,10 +481,9 @@
   pixels
   (selected nil))
 
-(defun make-genome (renderer thumb-w thumb-h)
-  "Generate a random genome, evaluate it, upload texture."
-  (let* ((genome (make-rgb-genome))
-         (pixels (eval-genome-to-pixels genome thumb-w thumb-h))
+(defun make-random-individual (renderer thumb-w thumb-h)
+  (let* ((genome  (make-rgb-genome))
+         (pixels  (eval-genome-to-pixels genome thumb-w thumb-h))
          (texture (pixels-to-texture renderer pixels thumb-w thumb-h)))
     (make-individual :genome genome :texture texture :pixels pixels)))
 
@@ -258,7 +494,7 @@
 (defun make-population (renderer n thumb-w thumb-h)
   "Create N random individuals."
   (format t "~&Generating ~A random genomes...~%" n)
-  (loop repeat n collect (make-genome renderer thumb-w thumb-h)))
+  (loop repeat n collect (make-random-individual renderer thumb-w thumb-h)))
 
 (defun free-population (pop)
   (mapc #'free-individual pop))
@@ -273,109 +509,109 @@
 
 ;; implicit defun of (make-state :pop pop :renderer renderer :selected nil :dirty t)
 
-(defun free-state (state)
-  (free-population (state-pop state)))
-
-(defun replace-tile (state ix iy)
-  "Generate new image for the slot at ix,iy"
-  (let ((renderer (state-renderer state))
-        (pop      (state-pop state))
-        (idx      (+ (* iy *thumb-cols*) ix)))
-    (free-individual (nth idx pop))
-    (setf (nth idx pop)
-          (make-genome renderer *thumb-w* *thumb-h*))
-    (setf (state-dirty state) t)))
-
-(defun mark-selected (state ix iy)
-  (let ((pop      (state-pop state))
-        (idx      (+ (* iy *thumb-cols*) ix))
-        (selected (state-selected state)))
-    (setf (individual-selected (nth idx pop)) t)
-    (setf (state-selected state) (cons (cons ix iy) selected))))
+(defun free-state (s)
+  (free-population (state-pop s)))
 
 (defun toggle-selected (state ix iy)
-  (let ((pop      (state-pop state))
-        (idx      (+ (* iy *thumb-cols*) ix))
-        (selected (state-selected state)))
-    (let* ((indiv (nth idx pop))
-           (prev-state (individual-selected indiv)))
-      (setf (individual-selected indiv) (not prev-state))
-      (if prev-state
-	  ;; if cell was selected remove it
-          (setf (state-selected state) (remove (cons ix iy) selected :test #'equal))
-	  ;; else add it
-          (setf (state-selected state) (cons (cons ix iy) selected))))))
+  (let* ((idx   (+ (* iy *thumb-cols*) ix))
+         (indiv (nth idx (state-pop state)))
+         (pos   (cons ix iy)))
+    (if (individual-selected indiv)
+        (progn (setf (individual-selected indiv) nil)
+               ;; if cell was selected remove it
+               (setf (state-selected state)
+                     (remove pos (state-selected state) :test #'equal)))
+        (progn (setf (individual-selected indiv) t)
+               ;; else add it
+               (push pos (state-selected state))))))
 
 (defun clear-selected (state)
-  (let ((pop      (state-pop state))
-        (selected (state-selected state)))
-    (loop for pos in selected
-          do (let* ((ix (car pos))
-                    (iy (cdr pos))
-                    (idx (+ (* iy *thumb-cols*) ix))
-                    (indiv (nth idx pop)))
-               (setf (individual-selected indiv) nil)))
-    (setf (state-selected state) nil)))
+  (dolist (pos (state-selected state))
+    (let ((indiv (nth (+ (* (cdr pos) *thumb-cols*) (car pos))
+                      (state-pop state))))
+      (setf (individual-selected indiv) nil)))
+  (setf (state-selected state) nil))
 
 
-;;; ── Event loop functions  ──────────────────────────────────────────────────
+;;; ── Event Handlers ─────────────────────────────────────────────────────────
 (defun handle-keydown (state keysym)
   (let ((sc       (sdl2:scancode-value keysym))
-        (pop-size (* *thumb-cols* *thumb-rows*))
         (renderer (state-renderer state))
-        (pop      (state-pop state)))
+        (pop-size (* *thumb-cols* *thumb-rows*)))
     (cond
       ;; Q or Escape: quit
       ((or (sdl2:scancode= sc :scancode-escape)
            (sdl2:scancode= sc :scancode-q))
        (sdl2:push-event :quit))
 
-      ;; R: regenerate entire population
+      ;; E: evolve -- breed offspring from selected parents into empty slots
+      ((sdl2:scancode= sc :scancode-e)
+       (evolve-population state))
+
+      ;; D: dissolve -- fill grid with interpolations between 2 selected parents
+      ((sdl2:scancode= sc :scancode-d)
+       (dissolve-selected state))
+
+      ;; M: mutate selected images in place
+      ((sdl2:scancode= sc :scancode-m)
+       (dolist (pos (state-selected state))
+         (let* ((idx     (+ (* (cdr pos) *thumb-cols*) (car pos)))
+                (ind     (nth idx (state-pop state)))
+                (mutated (mutate-genome (individual-genome ind)))
+                (pixels  (eval-genome-to-pixels mutated *thumb-w* *thumb-h*))
+                (texture (pixels-to-texture renderer pixels *thumb-w* *thumb-h*)))
+           (free-individual ind)
+           (setf (nth idx (state-pop state))
+                 (make-individual :genome mutated :texture texture
+                                  :pixels pixels :selected t))))
+       (setf (state-dirty state) t))
+
+      ;; X: clear selection without doing anything
+      ((sdl2:scancode= sc :scancode-x)
+       (clear-selected state)
+       (setf (state-dirty state) t))
+
+      ;; R: full random reset
       ((sdl2:scancode= sc :scancode-r)
-       (format t "~&Regenerating population...~%")
-       (free-population pop)
-       (setf (state-pop state)
-               (make-population renderer pop-size *thumb-w* *thumb-h*)
+       (free-population (state-pop state))
+       (clear-selected state)
+       (setf (state-pop   state)
+             (make-population renderer pop-size *thumb-w* *thumb-h*)
              (state-dirty state) t))
 
-      ;; Space: regenerate selected individuals
-      ((sdl2:scancode= sc :scancode-space)
-       (let ((selected (state-selected state)))
-         (loop for pos in selected
-               do (let* ((ix (car pos))
-                         (iy (cdr pos)))
-                    (replace-tile state ix iy)))
-         (clear-selected state)
-         (setf (state-dirty state) t))) )))
+      ;; P: print selected genomes to REPL for inspection / saving
+      ((sdl2:scancode= sc :scancode-p)
+       (dolist (pos (state-selected state))
+         (let* ((idx (+ (* (cdr pos) *thumb-cols*) (car pos)))
+                (g   (individual-genome (nth idx (state-pop state)))))
+           (format t "~&Genome at ~A:~%  R: ~S~%  G: ~S~%  B: ~S~%~%"
+                   pos (first g) (second g) (third g))))))))
 
 (defun handle-mouse (state x y button)
   (when (= button sdl2-ffi:+sdl-button-left+)
-    (let* ((ix       (truncate x *tile-w*))
-           (iy       (truncate y *tile-h*)))
+    (let ((ix       (truncate x *tile-w*))
+          (iy       (truncate y *tile-h*)))
       ;;(format t "Mouse click: ~a ~a ==> ~a ~a~%" x y ix iy)
       (toggle-selected state ix iy)
-      (format t "State-selected = ~a~%" (state-selected state))
+      ;;(format t "State-selected = ~a~%" (state-selected state))
       (setf (state-dirty state) t))))
 
 (defun handle-idle (state)
   (when (state-dirty state)
     (let ((renderer     (state-renderer state))
           (pop          (state-pop state))
-	  (num-selected (length (state-selected state))))
-      ;; bg to the whole window is *border-color* (black)
+          (num-selected (length (state-selected state))))
       (sdl2:set-render-draw-color renderer
-         (first *border-color*) (third *border-color*) (third *border-color*) 255)
+        (first *border-color*) (second *border-color*) (third *border-color*) 255)
       (sdl2:render-clear renderer)
       (loop for ind in pop
             for i from 0
             do (let ((ix (mod i *thumb-cols*))
                      (iy (truncate i *thumb-cols*))
-                     (selected (if (individual-selected ind)
-				   (if (> num-selected 1)
-				       *multi-sel-color*
-				       *selected-color*)
-                                   nil)))
-                 ;;(when selected (format t  "render ~a,~a selected~%" ix iy))
+                     (selected (when (individual-selected ind)
+                                 (if (> num-selected 1)
+                                     *multi-sel-color*
+                                     *selected-color*))))
                  (render-thumbnail renderer (individual-texture ind)
                                    ix iy selected
                                    *tile-w* *tile-h* *border*)))
@@ -386,16 +622,27 @@
 
 ;;; ── Main ───────────────────────────────────────────────────────────────────
 (defun main ()
+  ;; usage guide:
+  (format t "~&
+GP Image Evolver
+  Click          select / deselect
+  E              evolve: breed offspring from selected parent(s)
+  D              dissolve: interpolate between exactly 2 selected
+  M              mutate selected in place
+  X              clear selection
+  R              random reset
+  P              print genome(s) to REPL
+  Q / Escape     quit
+~%")
   ;; calc screen-width / screen-height
-  (let ((screen-width  (* *thumb-cols* *tile-w*))
-        (screen-height (* *thumb-rows* *tile-h*)))
+  (let ((screen-w (* *thumb-cols* *tile-w*))
+        (screen-h (* *thumb-rows* *tile-h*))
+        (title "GP Image Evolver  E=evolve D=dissolve M=mutate R=reset"))
     (sdl2:with-init (:video)
-      (sdl2:with-window (win :title "GP Image Explorer"
-                             :w screen-width :h screen-height
-                             :flags '(:shown))
+      (sdl2:with-window (win :title title :w screen-w :h screen-h :flags '(:shown))
         (sdl2:with-renderer (renderer win :flags '(:accelerated))
           (let* ((pop-size (* *thumb-cols* *thumb-rows*))
-                 (pop      (make-population renderer pop-size *tile-w* *tile-h*))
+                 (pop      (make-population renderer pop-size *thumb-w* *thumb-h*))
                  (state    (make-state :renderer renderer :pop pop)))
             (sdl2:with-event-loop (:method :poll)
               (:quit () t)
@@ -403,11 +650,7 @@
               (:mousebuttondown (:x x :y y :button button)
                                 (handle-mouse state x y button))
               (:idle () (handle-idle state)))
-
             (free-state state)
-            t))))))                       ;return t instead of pop list
-
-;; Print a sample genome to the REPL for inspection
-;;(format t "~&Sample genome:~%~S~%~%" (make-rgb-genome))
+            t))))))                       ;return t instead of the pop list
 
 (main)
