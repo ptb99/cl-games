@@ -8,15 +8,20 @@
 
 
 ;;; ── Constants ──────────────────────────────────────────────────────────────
-(defparameter *thumb-cols*    4)
-(defparameter *thumb-rows*    3)
-(defparameter *thumb-w*       100)
-(defparameter *thumb-h*       100)
-(defparameter *border*        5)
-(defparameter *tile-w*        (+ *thumb-w* (* 2 *border*)))
-(defparameter *tile-h*        (+ *thumb-h* (* 2 *border*)))
-(defparameter *max-depth*     6)    ; max initial tree depth
-(defparameter *min-depth*     2)    ; min initial tree depth
+(defparameter *thumb-cols*      4)
+(defparameter *thumb-rows*      3)
+(defparameter *thumb-w*         100)
+(defparameter *thumb-h*         100)
+(defparameter *border*          5)
+(defparameter *border-color*    '(20 20 20))
+(defparameter *selected-color*  '(255 255 255))
+(defparameter *multi-sel-color* '(150 150 150))
+(defparameter *tile-w*          (+ *thumb-w* (* 2 *border*)))
+(defparameter *tile-h*          (+ *thumb-h* (* 2 *border*)))
+(defparameter *max-depth*       6)    ; max initial tree depth
+(defparameter *min-depth*       2)    ; min initial tree depth
+(defparameter *mutation-rate*   0.01)
+(defparameter *idle-delay*      50)   ;pause in ms
 
 
 ;;; ── GP Function and Terminal Sets ──────────────────────────────────────────
@@ -132,6 +137,18 @@
         (random-expr)
         (random-expr)))
 
+(defun mutate (expr)
+  "Replace a random subtree with a new random expression."
+  (if (or (atom expr) (< (random 1.0) *mutation-rate*))
+      (random-expr *max-depth*)
+      (cons (car expr)
+            (mapcar #'mutate (cdr expr)))))
+
+;; (defun crossover (expr1 expr2)
+;;   "Swap a random subtree from expr2 into expr1."
+;;   (let ((subtree (random-subtree expr2)))
+;;     (replace-random-subtree expr1 subtree)))
+
 
 ;;; ── Genome Evaluation ──────────────────────────────────────────────────────
 (defun eval-expr (expr x y)
@@ -202,20 +219,30 @@
       (sdl2:update-texture texture nil ptr (* width 3)))
     texture))
 
-(defun render-thumbnail (renderer texture ix iy tile-w tile-h border)
+(defun render-thumbnail (renderer texture ix iy selected-color
+                         tile-w tile-h border) ;these could be constants
   "Blit a thumbnail texture to grid position (ix, iy)."
-  (let ((dest (sdl2:make-rect (+ (* ix tile-w) border)
-                              (+ (* iy tile-h) border)
-                              (- tile-w (* 2 border))
-                              (- tile-h (* 2 border)))))
-    (sdl2:render-copy renderer texture :dest-rect dest)))
+  (let* ((x (* ix tile-w))
+         (y (* iy tile-h))
+         (outer-rect (sdl2:make-rect x y tile-w tile-h))
+         (inner-rect (sdl2:make-rect (+ x border) (+ y border)
+                                     (- tile-w (* 2 border))
+                                     (- tile-h (* 2 border)))))
+    ;;(format t "render ~a,~a - ~a~%" ix iy selected-color)
+    ;; first render the border, depending on selected state
+    (when selected-color
+      (sdl2:set-render-draw-color renderer
+        (first selected-color) (second selected-color) (third selected-color) 255)
+      (sdl2:render-fill-rect renderer outer-rect))
+    (sdl2:render-copy renderer texture :dest-rect inner-rect)))
 
 
 ;;; ── Population ─────────────────────────────────────────────────────────────
 (defstruct individual
   genome
   texture
-  pixels)
+  pixels
+  (selected nil))
 
 (defun make-genome (renderer thumb-w thumb-h)
   "Generate a random genome, evaluate it, upload texture."
@@ -241,9 +268,10 @@
 (defstruct state
   pop
   renderer
+  (selected nil)
   (dirty t))
 
-;; implicit defun of (make-state :pop pop :renderer renderer :dirty t)
+;; implicit defun of (make-state :pop pop :renderer renderer :selected nil :dirty t)
 
 (defun free-state (state)
   (free-population (state-pop state)))
@@ -257,6 +285,37 @@
     (setf (nth idx pop)
           (make-genome renderer *thumb-w* *thumb-h*))
     (setf (state-dirty state) t)))
+
+(defun mark-selected (state ix iy)
+  (let ((pop      (state-pop state))
+        (idx      (+ (* iy *thumb-cols*) ix))
+        (selected (state-selected state)))
+    (setf (individual-selected (nth idx pop)) t)
+    (setf (state-selected state) (cons (cons ix iy) selected))))
+
+(defun toggle-selected (state ix iy)
+  (let ((pop      (state-pop state))
+        (idx      (+ (* iy *thumb-cols*) ix))
+        (selected (state-selected state)))
+    (let* ((indiv (nth idx pop))
+           (prev-state (individual-selected indiv)))
+      (setf (individual-selected indiv) (not prev-state))
+      (if prev-state
+	  ;; if cell was selected remove it
+          (setf (state-selected state) (remove (cons ix iy) selected :test #'equal))
+	  ;; else add it
+          (setf (state-selected state) (cons (cons ix iy) selected))))))
+
+(defun clear-selected (state)
+  (let ((pop      (state-pop state))
+        (selected (state-selected state)))
+    (loop for pos in selected
+          do (let* ((ix (car pos))
+                    (iy (cdr pos))
+                    (idx (+ (* iy *thumb-cols*) ix))
+                    (indiv (nth idx pop)))
+               (setf (individual-selected indiv) nil)))
+    (setf (state-selected state) nil)))
 
 
 ;;; ── Event loop functions  ──────────────────────────────────────────────────
@@ -276,40 +335,53 @@
        (format t "~&Regenerating population...~%")
        (free-population pop)
        (setf (state-pop state)
-             (make-population renderer pop-size *thumb-w* *thumb-h*)
-             (state-dirty state)
-             t))
+               (make-population renderer pop-size *thumb-w* *thumb-h*)
+             (state-dirty state) t))
 
-      ;; Space: regenerate a single random individual
+      ;; Space: regenerate selected individuals
       ((sdl2:scancode= sc :scancode-space)
-       (let ((ix (random *thumb-cols*))
-	     (iy (random *thumb-rows*)))
-	 (replace-tile state ix iy))) )))
-
+       (let ((selected (state-selected state)))
+         (loop for pos in selected
+               do (let* ((ix (car pos))
+                         (iy (cdr pos)))
+                    (replace-tile state ix iy)))
+         (clear-selected state)
+         (setf (state-dirty state) t))) )))
 
 (defun handle-mouse (state x y button)
   (when (= button sdl2-ffi:+sdl-button-left+)
     (let* ((ix       (truncate x *tile-w*))
            (iy       (truncate y *tile-h*)))
-      (format t "Mouse click: ~a ~a ==> ~a ~a~%" x y ix iy)
-      (replace-tile state ix iy))))
+      ;;(format t "Mouse click: ~a ~a ==> ~a ~a~%" x y ix iy)
+      (toggle-selected state ix iy)
+      (format t "State-selected = ~a~%" (state-selected state))
+      (setf (state-dirty state) t))))
 
 (defun handle-idle (state)
   (when (state-dirty state)
-    (let ((renderer (state-renderer state))
-          (pop      (state-pop state)))
-      (sdl2:set-render-draw-color renderer 20 20 20 255)
+    (let ((renderer     (state-renderer state))
+          (pop          (state-pop state))
+	  (num-selected (length (state-selected state))))
+      ;; bg to the whole window is *border-color* (black)
+      (sdl2:set-render-draw-color renderer
+         (first *border-color*) (third *border-color*) (third *border-color*) 255)
       (sdl2:render-clear renderer)
       (loop for ind in pop
             for i from 0
             do (let ((ix (mod i *thumb-cols*))
-                     (iy (truncate i *thumb-cols*)))
-		 (render-thumbnail renderer
-                                   (individual-texture ind)
-                                   ix iy *tile-w* *tile-h* *border*)))
+                     (iy (truncate i *thumb-cols*))
+                     (selected (if (individual-selected ind)
+				   (if (> num-selected 1)
+				       *multi-sel-color*
+				       *selected-color*)
+                                   nil)))
+                 ;;(when selected (format t  "render ~a,~a selected~%" ix iy))
+                 (render-thumbnail renderer (individual-texture ind)
+                                   ix iy selected
+                                   *tile-w* *tile-h* *border*)))
       (sdl2:render-present renderer)
       (setf (state-dirty state) nil)))
-  (sdl2:delay 16))
+  (sdl2:delay *idle-delay*))
 
 
 ;;; ── Main ───────────────────────────────────────────────────────────────────
@@ -329,7 +401,7 @@
               (:quit () t)
               (:keydown (:keysym keysym) (handle-keydown state keysym))
               (:mousebuttondown (:x x :y y :button button)
-				(handle-mouse state x y button))
+                                (handle-mouse state x y button))
               (:idle () (handle-idle state)))
 
             (free-state state)
