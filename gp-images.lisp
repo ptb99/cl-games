@@ -25,9 +25,9 @@
 (defparameter *min-depth*       2)    ; min initial tree depth
 (defparameter *max-nodes*       150)   ; discard offspring larger than this
 ;;Mutation rate scales inversely with tree size (Sims' key insight)
-(defparameter *base-mutation-rate*  0.08)
+(defparameter *base-mutation-rate*  0.15)
 (defparameter *const-adjust-prob*   0.3)   ; prob of nudging a constant vs replacing
-(defparameter *const-adjust-amount* 0.3)   ; max nudge magnitude
+(defparameter *const-adjust-amount* 0.5)   ; max nudge magnitude
 
 
 ;;; ── GP Function and Terminal Sets ──────────────────────────────────────────
@@ -172,6 +172,151 @@
                           collect name)))
     (when candidates
       (nth (random (length candidates)) candidates))))
+
+
+;;; ── SDL2 Rendering ─────────────────────────────────────────────────────────
+(defun pixels-to-texture (renderer pixels width height)
+  "Upload a flat RGB pixel array to an SDL2 texture."
+  (let ((texture (sdl2:create-texture renderer
+                                       sdl2-ffi:+sdl-pixelformat-rgb24+
+                                       sdl2-ffi:+sdl-textureaccess-streaming+
+                                       width height)))
+    (cffi:with-pointer-to-vector-data (ptr pixels)
+      (sdl2:update-texture texture nil ptr (* width 3)))
+    texture))
+
+(defun render-thumbnail (renderer texture ix iy sel-color
+                         tile-w tile-h border) ;these could be constants
+  "Blit a thumbnail texture to grid position (ix, iy)."
+  (let* ((x     (* ix tile-w))
+         (y     (* iy tile-h))
+         (outer (sdl2:make-rect x y tile-w tile-h))
+         (inner (sdl2:make-rect (+ x border) (+ y border)
+                                (- tile-w (* 2 border))
+                                (- tile-h (* 2 border)))))
+    ;; first render the border, depending on selected state
+    (when sel-color
+      (sdl2:set-render-draw-color renderer
+        (first sel-color) (second sel-color) (third sel-color) 255)
+      (sdl2:render-fill-rect renderer outer))
+    (sdl2:render-copy renderer texture :dest-rect inner)))
+
+
+;;; ── Genome Evaluation ──────────────────────────────────────────────────────
+(defun eval-expr (expr x y)
+  "Evaluate an expression tree at normalized coordinates (x y) in [-1,1].
+   Returns a float in [-1, 1]."
+  (cond
+    ;; Terminals
+    ((eq  expr 'x)   x)
+    ((eq  expr 'y)   y)
+    ((numberp expr)  (clamp expr))
+
+    ;; Compound expressions
+    ((consp expr)
+     (let ((fn   (car expr))
+           (args (cdr expr)))
+       (case fn
+         ;; warp: evaluate first arg as dx, second as dy,
+         ;; then evaluate third arg at warped coordinates
+         (warp
+          (let ((dx (eval-expr (first  args) x y))
+                (dy (eval-expr (second args) x y)))
+            (eval-expr (third args)
+                       (clamp (+ x dx))
+                       (clamp (+ y dy)))))
+         ;; All other functions: evaluate args then apply
+         (otherwise
+          (clamp (apply fn (mapcar (lambda (a) (eval-expr a x y)) args)))))))
+
+    ;; fallback for anything unexpected
+    (t 0.0)))
+
+(defun value-to-byte (v)
+  "Convert a [-1,1] float to a [0,255] byte."
+  (round (* 255 (/ (+ v 1.0) 2.0))))
+
+(defun eval-genome-to-pixels (genome width height)
+  "Evaluate an RGB genome across a width x height grid.
+   Returns a flat (unsigned-byte 8) array in RGB format."
+  (let ((pixels (make-array (* width height 3)
+                             :element-type '(unsigned-byte 8)
+                             :initial-element 0))
+        (r-expr (first  genome))
+        (g-expr (second genome))
+        (b-expr (third  genome)))
+    (dotimes (py height)
+      (dotimes (px width)
+        ;; Normalize pixel coords to [-1, 1]
+        (let* ((x   (- (* 2.0 (/ px (float (1- width))))  1.0))
+               (y   (- (* 2.0 (/ py (float (1- height)))) 1.0))
+               (r   (value-to-byte (eval-expr r-expr x y)))
+               (g   (value-to-byte (eval-expr g-expr x y)))
+               (b   (value-to-byte (eval-expr b-expr x y)))
+               (idx (* 3 (+ (* py width) px))))
+          (setf (aref pixels idx)       r
+                (aref pixels (+ idx 1)) g
+                (aref pixels (+ idx 2)) b))))
+    pixels))
+
+
+;;; ── Population ─────────────────────────────────────────────────────────────
+(defstruct individual
+  genome
+  texture
+  pixels
+  (selected nil))
+
+(defun make-random-individual (renderer thumb-w thumb-h)
+  (let* ((genome  (make-rgb-genome))
+         (pixels  (eval-genome-to-pixels genome thumb-w thumb-h))
+         (texture (pixels-to-texture renderer pixels thumb-w thumb-h)))
+    (make-individual :genome genome :texture texture :pixels pixels)))
+
+(defun free-individual (ind)
+  (when (individual-texture ind)
+    (sdl2:destroy-texture (individual-texture ind))))
+
+(defun make-population (renderer n thumb-w thumb-h)
+  "Create N random individuals."
+  (format t "~&Generating ~A random genomes...~%" n)
+  (loop repeat n collect (make-random-individual renderer thumb-w thumb-h)))
+
+(defun free-population (pop)
+  (mapc #'free-individual pop))
+
+
+;;; ── State struct ───────────────────────────────────────────────────────────
+(defstruct state
+  pop
+  renderer
+  (selected nil)
+  (dirty t))
+
+;; implicit defun of (make-state :pop pop :renderer renderer :selected nil :dirty t)
+
+(defun free-state (s)
+  (free-population (state-pop s)))
+
+(defun toggle-selected (state ix iy)
+  (let* ((idx   (+ (* iy *thumb-cols*) ix))
+         (indiv (nth idx (state-pop state)))
+         (pos   (cons ix iy)))
+    (if (individual-selected indiv)
+        (progn (setf (individual-selected indiv) nil)
+               ;; if cell was selected remove it
+               (setf (state-selected state)
+                     (remove pos (state-selected state) :test #'equal)))
+        (progn (setf (individual-selected indiv) t)
+               ;; else add it
+               (push pos (state-selected state))))))
+
+(defun clear-selected (state)
+  (dolist (pos (state-selected state))
+    (let ((indiv (nth (+ (* (cdr pos) *thumb-cols*) (car pos))
+                      (state-pop state))))
+      (setf (individual-selected indiv) nil)))
+  (setf (state-selected state) nil))
 
 
 ;;; ── Mutation ───────────────────────────────────────────────────────────────
@@ -350,8 +495,7 @@
                          (make-individual :genome child :texture texture
                                           :pixels pixels)))))
       (clear-selected state)
-      (setf (state-dirty state) t)
-      (format t "~&Evolution complete.~%"))))
+      (setf (state-dirty state) t))))
 
 (defun dissolve-selected (state)
   "Fill non-selected slots with dissolve steps between exactly 2 parents."
@@ -384,153 +528,7 @@
                          (make-individual :genome child :texture texture
                                           :pixels pixels)))))
       (clear-selected state)
-      (setf (state-dirty state) t)
-      (format t "~&Dissolve complete.~%"))))
-
-
-;;; ── Genome Evaluation ──────────────────────────────────────────────────────
-(defun eval-expr (expr x y)
-  "Evaluate an expression tree at normalized coordinates (x y) in [-1,1].
-   Returns a float in [-1, 1]."
-  (cond
-    ;; Terminals
-    ((eq  expr 'x)   x)
-    ((eq  expr 'y)   y)
-    ((numberp expr)  (clamp expr))
-
-    ;; Compound expressions
-    ((consp expr)
-     (let ((fn   (car expr))
-           (args (cdr expr)))
-       (case fn
-         ;; warp: evaluate first arg as dx, second as dy,
-         ;; then evaluate third arg at warped coordinates
-         (warp
-          (let ((dx (eval-expr (first  args) x y))
-                (dy (eval-expr (second args) x y)))
-            (eval-expr (third args)
-                       (clamp (+ x dx))
-                       (clamp (+ y dy)))))
-         ;; All other functions: evaluate args then apply
-         (otherwise
-          (clamp (apply fn (mapcar (lambda (a) (eval-expr a x y)) args)))))))
-
-    ;; fallback for anything unexpected
-    (t 0.0)))
-
-(defun value-to-byte (v)
-  "Convert a [-1,1] float to a [0,255] byte."
-  (round (* 255 (/ (+ v 1.0) 2.0))))
-
-(defun eval-genome-to-pixels (genome width height)
-  "Evaluate an RGB genome across a width x height grid.
-   Returns a flat (unsigned-byte 8) array in RGB format."
-  (let ((pixels (make-array (* width height 3)
-                             :element-type '(unsigned-byte 8)
-                             :initial-element 0))
-        (r-expr (first  genome))
-        (g-expr (second genome))
-        (b-expr (third  genome)))
-    (dotimes (py height)
-      (dotimes (px width)
-        ;; Normalize pixel coords to [-1, 1]
-        (let* ((x   (- (* 2.0 (/ px (float (1- width))))  1.0))
-               (y   (- (* 2.0 (/ py (float (1- height)))) 1.0))
-               (r   (value-to-byte (eval-expr r-expr x y)))
-               (g   (value-to-byte (eval-expr g-expr x y)))
-               (b   (value-to-byte (eval-expr b-expr x y)))
-               (idx (* 3 (+ (* py width) px))))
-          (setf (aref pixels idx)       r
-                (aref pixels (+ idx 1)) g
-                (aref pixels (+ idx 2)) b))))
-    pixels))
-
-
-;;; ── SDL2 Rendering ─────────────────────────────────────────────────────────
-(defun pixels-to-texture (renderer pixels width height)
-  "Upload a flat RGB pixel array to an SDL2 texture."
-  (let ((texture (sdl2:create-texture renderer
-                                       sdl2-ffi:+sdl-pixelformat-rgb24+
-                                       sdl2-ffi:+sdl-textureaccess-streaming+
-                                       width height)))
-    (cffi:with-pointer-to-vector-data (ptr pixels)
-      (sdl2:update-texture texture nil ptr (* width 3)))
-    texture))
-
-(defun render-thumbnail (renderer texture ix iy sel-color
-                         tile-w tile-h border) ;these could be constants
-  "Blit a thumbnail texture to grid position (ix, iy)."
-  (let* ((x     (* ix tile-w))
-         (y     (* iy tile-h))
-         (outer (sdl2:make-rect x y tile-w tile-h))
-         (inner (sdl2:make-rect (+ x border) (+ y border)
-                                (- tile-w (* 2 border))
-                                (- tile-h (* 2 border)))))
-    ;; first render the border, depending on selected state
-    (when sel-color
-      (sdl2:set-render-draw-color renderer
-        (first sel-color) (second sel-color) (third sel-color) 255)
-      (sdl2:render-fill-rect renderer outer))
-    (sdl2:render-copy renderer texture :dest-rect inner)))
-
-
-;;; ── Population ─────────────────────────────────────────────────────────────
-(defstruct individual
-  genome
-  texture
-  pixels
-  (selected nil))
-
-(defun make-random-individual (renderer thumb-w thumb-h)
-  (let* ((genome  (make-rgb-genome))
-         (pixels  (eval-genome-to-pixels genome thumb-w thumb-h))
-         (texture (pixels-to-texture renderer pixels thumb-w thumb-h)))
-    (make-individual :genome genome :texture texture :pixels pixels)))
-
-(defun free-individual (ind)
-  (when (individual-texture ind)
-    (sdl2:destroy-texture (individual-texture ind))))
-
-(defun make-population (renderer n thumb-w thumb-h)
-  "Create N random individuals."
-  (format t "~&Generating ~A random genomes...~%" n)
-  (loop repeat n collect (make-random-individual renderer thumb-w thumb-h)))
-
-(defun free-population (pop)
-  (mapc #'free-individual pop))
-
-
-;;; ── State struct ───────────────────────────────────────────────────────────
-(defstruct state
-  pop
-  renderer
-  (selected nil)
-  (dirty t))
-
-;; implicit defun of (make-state :pop pop :renderer renderer :selected nil :dirty t)
-
-(defun free-state (s)
-  (free-population (state-pop s)))
-
-(defun toggle-selected (state ix iy)
-  (let* ((idx   (+ (* iy *thumb-cols*) ix))
-         (indiv (nth idx (state-pop state)))
-         (pos   (cons ix iy)))
-    (if (individual-selected indiv)
-        (progn (setf (individual-selected indiv) nil)
-               ;; if cell was selected remove it
-               (setf (state-selected state)
-                     (remove pos (state-selected state) :test #'equal)))
-        (progn (setf (individual-selected indiv) t)
-               ;; else add it
-               (push pos (state-selected state))))))
-
-(defun clear-selected (state)
-  (dolist (pos (state-selected state))
-    (let ((indiv (nth (+ (* (cdr pos) *thumb-cols*) (car pos))
-                      (state-pop state))))
-      (setf (individual-selected indiv) nil)))
-  (setf (state-selected state) nil))
+      (setf (state-dirty state) t))))
 
 
 ;;; ── Event Handlers ─────────────────────────────────────────────────────────
