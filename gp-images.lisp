@@ -543,7 +543,8 @@
        (sdl2:push-event :quit))
 
       ;; E: evolve -- breed offspring from selected parents into empty slots
-      ((sdl2:scancode= sc :scancode-e)
+      ((or (sdl2:scancode= sc :scancode-e)
+	   (sdl2:scancode= sc :scancode-space))
        (evolve-population state))
 
       ;; D: dissolve -- fill grid with interpolations between 2 selected parents
